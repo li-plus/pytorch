@@ -7598,6 +7598,8 @@ class TestConsistency(TestCase):
         'nn.functional.linear': ['f32'],
         'nn.functional.local_response_norm': ['f32'],
         'nn.functional.margin_ranking_loss': ['f32', 'i16', 'i32'],
+        'nn.functional.max_pool1d': ['f32'],
+        'nn.functional.max_pool2d': ['f32'],
         'nn.functional.mse_loss': ['f16', 'f32'],
         'nn.functional.pad': ['b8', 'f16', 'f32', 'i16', 'i32', 'i64'],
         'nn.functional.pairwise_distance': ['f16',
