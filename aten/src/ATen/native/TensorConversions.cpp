@@ -1766,7 +1766,7 @@ Tensor sparse_compressed_to_sparse(const Tensor& self, int64_t sparse_dim) {
   Tensor values;
   Tensor indices = at::_convert_indices_from_csr_to_coo(compressed_indices, plain_indices,
                                                         false, (layout == kSparseCsc || layout == kSparseBsc));
-  bool coalesced = true;
+  bool coalesced = (layout == kSparseCsr || layout == kSparseBsr);
   AT_DISPATCH_PLAIN_SPARSE_COMPRESSED_LAYOUTS(layout, "sparse_compressed_to_sparse",
     [&] { values = self.values(); },
     [&] {
@@ -1777,7 +1777,8 @@ Tensor sparse_compressed_to_sparse(const Tensor& self, int64_t sparse_dim) {
         .mul_(at::tensor({blocksize[0], blocksize[1]}, indices.options()).reshape({2, 1}))
         .add_(at::stack(at::where(at::ones(blocksize, indices.options()))).repeat({1, nnz}));
       values = self.values().flatten(0, 2);
-      coalesced = nnz == 1;
+      // The result is always coalesced with a single block.
+      coalesced |= (plain_indices.size(-1) == 1);
     });
   return at::native::_sparse_coo_tensor_unsafe(indices, values, self.sizes())._coalesced_(coalesced);
 }
