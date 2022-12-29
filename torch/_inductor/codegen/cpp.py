@@ -83,21 +83,25 @@ def reduction_init(reduction_type, dtype):
     raise AssertionError(reduction_type)
 
 
-def reduction_combine(reduction_type, var, next_value):
+def reduction_combine(reduction_type, var, next_value, threads_num=0):
     if reduction_type == "sum":
-        return f"{var} += {next_value}"
+        assert threads_num > 0
+        var_with_id = var.replace(f"[{threads_num}]", f"[tid]")
+        return f"{var_with_id} += {next_value}"
     if reduction_type == "any":
         return f"{var} = {var} || {next_value}"
     return f"{var} = std::{reduction_type}({var}, {next_value})"
 
 
-def reduction_combine_vec(reduction_type, var, next_value):
-    if reduction_type == "max":
+def reduction_combine_vec(reduction_type, var, next_value, threads_num=0):
+    if reduction_type == "sum":
+        assert threads_num > 0
+        var_with_id = var.replace(f"[{threads_num}]", f"[tid]")
+        return f"{var_with_id} += {next_value}"
+    elif reduction_type == "max":
         return f"{var} = at::vec::maximum({var}, {next_value})"
     elif reduction_type == "min":
         return f"{var} = at::vec::minimum({var}, {next_value})"
-    elif reduction_type == "sum":
-        return f"{var} += {next_value}"
     else:
         raise NotImplementedError()
 
@@ -608,9 +612,14 @@ class CppKernel(Kernel):
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
         argmax_or_argmin = reduction_type in {"argmax", "argmin"}
+        need_accmulate = reduction_type == "sum"
         tmpvar = self.cse.generate(
             self.loads, f"reduction {name} {cexpr(index)}", write=False
         )
+        if need_accmulate:
+            max_threads = parallel_num_threads()
+            tmpvar_to_accumulate = f"{tmpvar}_acc[{max_threads}]"
+            tmpvar_to_accumulate_with_idx = tmpvar_to_accumulate.replace(f"[{max_threads}]", f"[i]")
         index = self.rename_indexing(index)
         self.reduction_vars[tmpvar] = reduction_type
         if argmax_or_argmin:
@@ -634,13 +643,40 @@ class CppKernel(Kernel):
             self.reduction_prefix.writeline(
                 f"{DTYPE_TO_CPP[dtype]} {tmpvar} = {reduction_init(reduction_type, dtype)};"
             )
-            self.stores.writeline(
-                None, f"{reduction_combine(reduction_type, tmpvar, value)};"
-            )
+            if need_accmulate:
+                self.reduction_prefix.writeline(
+                    f"{DTYPE_TO_CPP[dtype]} {tmpvar_to_accumulate};"
+                )
+                self.reduction_prefix.writelines(
+                    [
+                        f"for (int i = 0; i < {max_threads}; i++) ",
+                        "{",
+                        f"    {tmpvar_to_accumulate_with_idx} = {0};",
+                        "}",
+                    ]
+                )
+                if not hasattr(self.stores, 'has_tid' ):
+                    self.stores.writeline(None, f"int tid = omp_get_thread_num();")
+                    setattr(self.stores, 'has_tid', True)
+                self.stores.writeline(
+                    None, f"{reduction_combine(reduction_type, tmpvar_to_accumulate, value, max_threads)};"
+                )
+            else:
+                self.stores.writeline(
+                    None, f"{reduction_combine(reduction_type, tmpvar, value)};"
+                )
 
         if name not in V.graph.removed_buffers:
             var = self.args.output(name)
             member_name = ".index" if argmax_or_argmin else ""
+            if need_accmulate:
+                self.reduction_suffix.writelines(
+                    None,
+                    [
+                        f"for (int i = 0; i < {max_threads}; i++)",
+                        f"    {tmpvar} += {tmpvar_to_accumulate_with_idx};"
+                    ]
+                )
             self.reduction_suffix.writeline(
                 name, f"{var}[{cexpr(index)}] = {tmpvar}{member_name};"
             )
@@ -832,20 +868,19 @@ class CppVecKernel(CppKernel):
         assert reduction_type in {"max", "min", "sum"}
         assert dtype == torch.float
         assert src_dtype == torch.float
+        max_threads = parallel_num_threads()
         reduce_map = {"max": "maximum", "min": "minimum"}
+        need_accmulate = reduction_type == "sum"
 
         vec_ns = "at::vec"
         vec = f"{vec_ns}::Vectorized<{DTYPE_TO_CPP[dtype]}>"
 
-        if reduction_type not in self.reduction_omp_dec:
+        if reduction_type not in self.reduction_omp_dec and not need_accmulate:
             vec_reduc_prefix = "#pragma omp declare reduction("
             vec_reduc_prefix += f"{RTYPE_TO_CPP[reduction_type]}:{vec}:"
-            if reduction_type == "sum":
-                vec_reduc_prefix += "omp_out += omp_in"
-            else:
-                vec_reduc_prefix += (
-                    f"omp_out = {vec_ns}::{reduce_map[reduction_type]}(omp_out, omp_in)"
-                )
+            vec_reduc_prefix += (
+                f"omp_out = {vec_ns}::{reduce_map[reduction_type]}(omp_out, omp_in)"
+            )
             vec_reduc_prefix += ")"
             vec_reduc_prefix += " initializer("
             vec_reduc_prefix += "omp_priv={{"
@@ -858,6 +893,9 @@ class CppVecKernel(CppKernel):
             self.loads, f"reduction {name} {cexpr(index)}", write=False
         )
         tmpvar_vec = f"{tmpvar}_vec"
+        if need_accmulate:
+            tmpvar_to_accumulate = f"{tmpvar}_acc[{max_threads}]"
+            tmpvar_vec_to_accumulate = f"{tmpvar}_vec_acc[{max_threads}]"
 
         index = self.rename_indexing(index)
         self.reduction_vars[tmpvar] = reduction_type
@@ -867,10 +905,42 @@ class CppVecKernel(CppKernel):
         self.reduction_prefix.writeline(
             f"auto {tmpvar_vec} = at::vec::Vectorized<{DTYPE_TO_CPP[dtype]}>({tmpvar});"
         )
-        self.stores.writeline(
-            None, f"{reduction_combine_vec(reduction_type, tmpvar_vec, value)};"
-        )
-
+        if need_accmulate:
+            self.reduction_prefix.writeline(
+                f"{DTYPE_TO_CPP[dtype]} {tmpvar_to_accumulate};"
+            )
+            self.reduction_prefix.writeline(
+                f"at::vec::Vectorized<{DTYPE_TO_CPP[dtype]}> {tmpvar_vec_to_accumulate};"
+            )
+            tmpvar_to_accumulate_with_idx = tmpvar_to_accumulate.replace(f"[{max_threads}]", f"[i]")
+            tmpvar_vec_to_accumulate_with_idx = tmpvar_vec_to_accumulate.replace(f"[{max_threads}]", f"[i]")
+            self.reduction_prefix.writelines(
+                [
+                    f"for (int i = 0; i < {max_threads}; i++) ",
+                    "{",
+                    f"    {tmpvar_to_accumulate_with_idx} = {0};",
+                    f"    {tmpvar_vec_to_accumulate_with_idx} = at::vec::Vectorized<{DTYPE_TO_CPP[dtype]}>({tmpvar});",
+                    "}",
+                ]
+            )
+            if not hasattr(self.stores, 'has_tid' ):
+                self.stores.writeline(None, f"int tid = omp_get_thread_num();")
+                setattr(self.stores, 'has_tid', True)
+            self.stores.writeline(
+                None, f"{reduction_combine_vec(reduction_type, tmpvar_vec_to_accumulate, value, max_threads)};"
+            )
+            self.reduction_suffix.writelines(
+                None,
+                [
+                    f"for (int i = 0; i < {max_threads}; i++)",
+                    f"    {tmpvar_vec} += {tmpvar_vec_to_accumulate_with_idx};"
+                ]
+            )
+        else:
+            self.stores.writeline(
+                None, f"{reduction_combine_vec(reduction_type, tmpvar_vec, value)};"
+            )
+        
         reduce_all_body = "{"
         if reduction_type == "sum":
             reduce_all_body += "return x + y;"
@@ -1235,7 +1305,7 @@ class CppKernelProxy(CppKernel):
                     # the vectorize as a single scalar. Hence, we set write_reduction_suffix to True to
                     # gen the code.
                     gen_vectorized_loop(
-                        loop_with_tail.main_loop, loop_with_tail.main_loop_body, True
+                        loop_with_tail.main_loop, loop_with_tail.main_loop_body, False
                     )
 
                     gen_vectorized_loop(
@@ -1245,6 +1315,7 @@ class CppKernelProxy(CppKernel):
                 if reduction_par_depth:
                     worksharing.close()
 
+                code.splice(loop_with_tail.main_loop_body.reduction_suffix)
                 code.splice(loop_with_tail.tail_loop_body.reduction_suffix)
 
 
@@ -1522,7 +1593,7 @@ class LoopLevel:
         if self.reduction_vars:
             suffix = "_vec" if self.simd_vec else ""
             reduction = " " + " ".join(
-                f"reduction({RTYPE_TO_CPP[rtype]}:{var}{suffix})"
+                f"reduction({RTYPE_TO_CPP[rtype]}:{var}{suffix})" if rtype != "sum" else ""
                 for var, rtype in self.reduction_vars.items()
             )
         else:
