@@ -583,6 +583,8 @@ std::shared_ptr<SugaredEnumClass> createSugaredEnumClassFromObj(
     const py::object& obj,
     GraphFunction& m,
     const SourceRange& loc) {
+    std::cout << "XXX " << __FILE__ << ":" << __LINE__ << ":" << __FUNCTION__
+      << std::endl;
   auto annotation_type = py::module::import("torch.jit.annotations")
                              .attr("try_ann_to_type")(obj, loc);
   TORCH_INTERNAL_ASSERT(!annotation_type.is_none());
@@ -1067,6 +1069,8 @@ std::shared_ptr<SugaredValue> createSimpleEnumValue(
     const py::object& obj,
     GraphFunction& m,
     const SourceRange& loc) {
+  std::cout << "XXX " << __FILE__ << ":" << __LINE__ << ":" << __FUNCTION__
+    << std::endl;
   auto enum_class = obj.attr("__class__");
   auto enum_type =
       py::cast<TypePtr>(py::module::import("torch.jit.annotations")
@@ -1207,6 +1211,9 @@ std::shared_ptr<SugaredValue> toSugaredValue(
       obj.ptr() == py::module::import("torch.jit").attr("_fork").ptr() ||
       obj.ptr() == py::module::import("torch.jit").attr("fork").ptr()) {
     return SpecialFormValue::create(prim::fork);
+  } else if (
+      obj.ptr() == py::module::import("torch.jit").attr("awaitable").ptr()) {
+    return SpecialFormValue::create(prim::awaitable);
   } else if (
       obj.ptr() == py::module::import("torch.jit").attr("annotate").ptr()) {
     return SpecialFormValue::create(prim::annotate);
