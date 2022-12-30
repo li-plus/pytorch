@@ -252,6 +252,7 @@ class FullyShardedDataParallel(nn.Module, _FSDPState):
             avoid sharding specific parameters at module granularity when using an
             ``auto_wrap_policy`` or if parameters' sharding is not managed by
             FSDP. (Default: ``None``)
+        ignored_parameters (Optional[Iterable[torch.nn.Parameter]]): 
         param_init_fn (Optional[Callable[[nn.Module], None]]):
             A ``Callable[torch.nn.Module] -> None`` that
             specifies how modules that are currently on the meta device should be initialized
@@ -331,10 +332,11 @@ class FullyShardedDataParallel(nn.Module, _FSDPState):
         forward_prefetch: bool = False,
         limit_all_gathers: bool = False,
         use_orig_params: bool = False,
+        ignored_parameters: Optional[Iterable[torch.nn.Parameter]] = None,
     ):
         torch._C._log_api_usage_once("torch.distributed.fsdp")
         super().__init__()
-        _init_ignored_module_states(self, module, ignored_modules)
+        _init_ignored_module_states(self, module, ignored_modules, ignored_parameters)
 
         # Add module annotations for Dynamo support (see function for details)
         _annotate_modules_for_dynamo(module, self._ignored_modules, use_orig_params)
