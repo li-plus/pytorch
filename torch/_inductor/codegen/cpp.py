@@ -7,9 +7,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List
 
+import numpy
 import sympy
 
 import torch
+import torch.fx
 from torch._prims_common import is_float_dtype
 
 from .. import codecache, config, ir, metrics
@@ -19,6 +21,7 @@ from ..virtualized import ops, V
 from .common import (
     BracesBuffer,
     CppWrapperKernelArgs,
+    CSEVariable,
     DeferredIndentedBuffer,
     ExprPrinter,
     IndentedBuffer,
@@ -232,6 +235,34 @@ class CppVecOverrides(OpOverrides):
         return f"{x}.sqrt()"
 
     @staticmethod
+    def eq(x, y):
+        return f"{x} == {y}"
+
+    @staticmethod
+    def ne(x, y):
+        return f"{x} != {y}"
+
+    @staticmethod
+    def lt(x, y):
+        return f"{x} < {y}"
+
+    @staticmethod
+    def gt(x, y):
+        return f"{x} > {y}"
+
+    @staticmethod
+    def le(x, y):
+        return f"{x} <= {y}"
+
+    @staticmethod
+    def ge(x, y):
+        return f"{x} >= {y}"
+
+    @staticmethod
+    def and_(x, y):
+        return f"{x} & {y}"
+
+    @staticmethod
     def rsqrt(x):
         return f"{x}.rsqrt()"
 
@@ -285,17 +316,19 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def constant(val, dtype):
+        proposed_dtype = V.interpreter.current_node.meta["dtype"]
         if val == float("inf"):
-            quote = f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::infinity()"
+            quote = f"std::numeric_limits<{DTYPE_TO_CPP[proposed_dtype]}>::infinity()"
         elif val == float("-inf"):
-            quote = f"-std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::infinity()"
+            quote = f"-std::numeric_limits<{DTYPE_TO_CPP[proposed_dtype]}>::infinity()"
         elif math.isnan(val):
-            quote = f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::quiet_NaN()"
+            quote = f"std::numeric_limits<{DTYPE_TO_CPP[proposed_dtype]}>::quiet_NaN()"
         elif val is True or val is False:
-            quote = f"static_cast<{DTYPE_TO_CPP[dtype]}>({str(val).lower()})"
+            quote = f"static_cast<{DTYPE_TO_CPP[proposed_dtype]}>({str(val).lower()})"
         else:
-            quote = f"static_cast<{DTYPE_TO_CPP[dtype]}>({repr(val)})"
-        return f"at::vec::Vectorized<{DTYPE_TO_CPP[dtype]}>({quote})"
+            quote = f"static_cast<{DTYPE_TO_CPP[proposed_dtype]}>({repr(val)})"
+
+        return f"at::vec::Vectorized<{DTYPE_TO_CPP[proposed_dtype]}>({quote})"
 
     @staticmethod
     def relu(x):
@@ -369,6 +402,40 @@ class CppVecOverrides(OpOverrides):
     @staticmethod
     def log1p(x):
         return f"{x}.log1p()"
+
+    @staticmethod
+    def masked(mask, body, other):
+        assert V.interpreter.current_node.meta["is_masked_load"]
+        code = BracesBuffer()
+
+        var = V.kernel.cse.newvar()
+        if other == float("-inf"):
+            code.writeline(
+                f"auto {var} = at::vec::Vectorized<float>(-std::numeric_limits<float>::infinity());"
+            )
+        elif other == float("inf"):
+            code.writeline(
+                f"auto {var} = at::vec::Vectorized<float>(std::numeric_limits<float>::infinity());"
+            )
+        elif isinstance(other, float):
+            code.writeline(f"auto {var} = at::vec::Vectorized<float>({other});")
+        else:
+            code.writeline(f"auto {var} = at::vec::Vectorized<float>({other!r});")
+        with V.kernel.swap_buffers(code), code.indent():
+            result = body()
+            zero_val = "at::vec::Vectorized<float>(0)"
+            float_mask = f"flag_to_float_vec({mask})"
+            blendv = f"decltype({result})::blendv({var}, {result}, {float_mask} != {zero_val})"
+            code.writeline(f"{var} = {blendv};")
+        V.kernel.compute.splice(code)
+        return var
+
+    @staticmethod
+    def index_expr(expr, dtype):
+        assert dtype == torch.int64
+        assert V.interpreter.current_node.meta["dtype"] == torch.int32
+        assert V.interpreter.current_node.meta["most_inner_loop_irrevelant"]
+        return f"at::vec::Vectorized<int>(static_cast<int>({cexpr(V.kernel.rename_indexing(expr))}))"
 
 
 class CppOverrides(OpOverrides):
@@ -905,8 +972,47 @@ class CppVecKernelChecker(CppVecKernel):
                 self.fast_vec_list.append(k)
         self.exit_stack = contextlib.ExitStack()
 
+        # Cache all the load result
+        self.load_results: list[CSEVariable] = []
+        self.load_supported_dtypes: list[torch.dtype] = [
+            torch.float,
+            torch.float32,
+            torch.bool,
+            torch.uint8,
+            torch.long,
+        ]
+        self.store_supported_dtypes: list[torch.dtype] = [torch.float, torch.float32]
+        # Cache the dtypes of the store operation. If the store is mixing dtypes, the
+        # vectorization would not support it as it is hard to determin the vec dtype
+        self.store_dtypes: list[torch.dtype] = []
+        # The dtype is used for vectorization
+        self.vec_dtype: torch.dtype = torch.float32
+
+    def decide_vec_dtype(self):
+        n_store_dtypes = len(self.store_dtypes)
+        if n_store_dtypes == 1:
+            self.vec_dtype = self.store_dtypes[0]
+
+        return self.vec_dtype
+
+    def is_indirect_indexing(self, index: sympy.Expr):
+        for _load_res in self.load_results:
+            # The index expression cotains a value that loads from memory
+            if index.count(sympy_symbol(_load_res.name)) > 0:
+                return True
+        return False
+
     def is_legal_data_access(self, var: sympy.Symbol, index: sympy.Expr):
-        return self.is_var_irrevelant(var, index) or self.is_single_step_var(var, index)
+        _indirect_indexing = self.is_indirect_indexing(index)
+        if _indirect_indexing:
+            return False
+
+        _loop_var_irrevelant = self.is_var_irrevelant(var, index)
+        _single_step = self.is_single_step_var(var, index)
+        if not _single_step and not _loop_var_irrevelant:
+            return False
+
+        return True
 
     def could_vec(self, name: str, index: sympy.Expr):
         assert self.itervars is not None
@@ -918,21 +1024,40 @@ class CppVecKernelChecker(CppVecKernel):
         return self.is_legal_data_access(most_inner_var, index)
 
     def load(self, name: str, index: sympy.Expr):
-        if not V.graph.get_dtype(name) in [
-            torch.float,
-            torch.float32,
-            torch.bool,
-            torch.uint8,
-        ]:
+        load_type = V.graph.get_dtype(name)
+        current_node: torch.fx.Node = V.interpreter.current_node
+        current_node.meta["dtype"] = load_type
+
+        var = self.cse.newvar()
+        self.load_results.append(var)
+
+        if not V.graph.get_dtype(name) in self.load_supported_dtypes:
             self.simd_vec = False
-            return self.simd_vec
+            return var
+
+        def is_mask():
+            user_nodes = current_node.users
+            for __node in user_nodes.keys():
+                _node: torch.fx.Node = __node
+                if _node.target not in ["where", "masked"]:
+                    return False
+            return True
+
+        current_node.meta["is_mask"] = is_mask()
 
         index = self.rename_indexing(index)
         self.simd_vec = self.simd_vec and self.could_vec(name, index)
-        return self.simd_vec
+        return var
 
     def store(self, name, index, value, mode=None):
-        if not V.graph.get_dtype(name) in [torch.float, torch.float32]:
+        store_dtype = V.graph.get_dtype(name)
+
+        current_node: torch.fx.Node = V.interpreter.current_node
+        current_node.meta["dtype"] = store_dtype
+
+        store_dtype = torch.float if store_dtype == torch.float32 else store_dtype
+        self.store_dtypes.append(store_dtype)
+        if store_dtype not in [torch.float, torch.float32]:
             self.simd_vec = False
             return self.simd_vec
 
@@ -956,6 +1081,27 @@ class CppVecKernelChecker(CppVecKernel):
         else:
             self.simd_vec = False
         return self.simd_vec
+
+    def is_load_only_block(self, sub_graph: torch.fx.Graph):
+        # The sub graph only contains "placeholder", "output", "get_index", "load"
+        is_load_only = False
+        load_dtype = None
+        skip_io_nodes = ["placeholder", "output"]
+        for _node in sub_graph.nodes:
+            if _node.op in skip_io_nodes:
+                continue
+
+            if _node.target not in ["load", "get_index"]:
+                # The body contains non load node
+                is_load_only = False
+                break
+
+            if _node.target == "load":
+                _, name, _ = _node.args
+                load_dtype = V.graph.get_dtype(name)
+                is_load_only = True
+
+        return is_load_only, load_dtype
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         assert self._orig_wrapper_code is not None
@@ -999,15 +1145,60 @@ class CppVecKernelChecker(CppVecKernel):
 
             @staticmethod
             def constant(val, dtype):
+                current_node: torch.fx.Node = V.interpreter.current_node
+                current_node.meta["dtype"] = dtype
+                i32_iinfo = numpy.iinfo(numpy.int32)
+                if (
+                    dtype == torch.int64
+                    and val <= i32_iinfo.max
+                    and val >= i32_iinfo.min
+                ):
+                    current_node.meta["dtype"] = torch.int32
+                f64_iinfo = numpy.finfo(numpy.float32)
+                if (
+                    dtype == torch.double
+                    and val <= f64_iinfo.max
+                    and val >= f64_iinfo.min
+                ):
+                    current_node.meta["dtype"] = torch.float32
+
                 supported_dtype = (torch.float32, torch.int32)
-                is_supported_dtype = dtype in (supported_dtype)
+                is_supported_dtype = current_node.meta["dtype"] in (supported_dtype)
                 if not is_supported_dtype:
                     self.simd_vec = False
                 return is_supported_dtype
 
             @staticmethod
             def index_expr(expr, dtype):
-                self.simd_vec = False
+                current_node: torch.fx.Node = V.interpreter.current_node
+
+                loop_range = {}
+                assert len(self.ranges) == len(self.itervars)
+                for idx in range(len(self.ranges)):
+                    loop_range[self.itervars[idx]] = self.ranges[idx]
+                expr_val = sympy.simplify(sympy_subs(expr, loop_range))
+                i32_iinfo = numpy.iinfo(numpy.int32)
+                if (
+                    dtype == torch.int64
+                    and expr_val <= i32_iinfo.max
+                    and expr_val >= i32_iinfo.min
+                ):
+                    current_node.meta["dtype"] = torch.int32
+                else:
+                    self.simd_vec = False
+
+                # Pick the most inner loop variable since we always vectorize the
+                # most inner loop
+                most_inner_var = self.itervars[-1]
+                most_inner_loop_irrevelant = self.is_var_irrevelant(
+                    most_inner_var, expr
+                )
+                if not most_inner_loop_irrevelant:
+                    self.simd_vec = False
+                current_node.meta[
+                    "most_inner_loop_irrevelant"
+                ] = most_inner_loop_irrevelant
+
                 tmp_var = self.cse.newvar()
                 return tmp_var
 
@@ -1018,11 +1209,24 @@ class CppVecKernelChecker(CppVecKernel):
 
             @staticmethod
             def masked(mask, body, other):
+                current_node: torch.fx.Node = V.interpreter.current_node
+                is_masked_load, load_dtype = self.is_load_only_block(body.graph)
+                current_node.meta["dtype"] = load_dtype
+                current_node.meta["is_masked_load"] = is_masked_load
+
+                self.simd_vec = is_masked_load and current_node.meta["dtype"] in [
+                    torch.float32,
+                    torch.float,
+                ]
+
                 tmp_var = self.cse.newvar()
                 return tmp_var
 
             @staticmethod
             def to_dtype(x, dtype):
+                current_node: torch.fx.Node = V.interpreter.current_node
+                current_node["dtype"] = dtype
+
                 if dtype != torch.bool:
                     self.simd_vec = False
                 return x

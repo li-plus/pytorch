@@ -3933,6 +3933,11 @@ class InterpreterShim(torch.fx.Interpreter):
         self.env = {}
         self.fetch_attr = submodules.__getitem__
         self.name = V.get_ops_handler().name
+        self.current_node = None
+
+    def run_node(self, n: torch.fx.Node) -> Any:
+        self.current_node = n
+        return super().run_node(n)
 
 
 class LoopBody:
@@ -4110,7 +4115,12 @@ class LoopBodyBlock:
         graph = self.graph
         submodules = self.body.submodules
 
-        return InterpreterShim(graph, submodules).run(V.get_ops_handler())
+        _orig_interpreter = V.interpreter
+        interpreter_shim = InterpreterShim(graph, submodules)
+        V.set_interpreter_handler(interpreter_shim)
+        res = interpreter_shim.run(V.get_ops_handler())
+        V.set_interpreter_handler(_orig_interpreter)
+        return res
 
     def debug_str(self, name="block"):
         code = torch.fx.GraphModule(self.body.submodules, self.graph).code

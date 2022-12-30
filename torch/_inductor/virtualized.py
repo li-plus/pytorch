@@ -130,6 +130,7 @@ ops = Virtualized("ops", MockHandler)
 _graph = Virtualized("graph", NullHandler)
 _kernel = Virtualized("kernel", NullHandler)
 _debug = Virtualized("debug", NullHandler)
+_interpreter = Virtualized("interpreter", NullHandler)
 
 
 class _V:
@@ -142,6 +143,7 @@ class _V:
     set_graph_handler = _graph._set_handler
     set_kernel_handler = _kernel._set_handler
     set_debug_handler = _debug._set_handler
+    set_interpreter_handler = _interpreter._set_handler
 
     @property
     def ops(self) -> MockHandler:
@@ -161,6 +163,10 @@ class _V:
     @property
     def debug(self):
         return _debug._get_handler()
+
+    @property
+    def interpreter(self):
+        return _interpreter._get_handler()
 
 
 V = _V()
